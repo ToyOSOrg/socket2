@@ -63,8 +63,8 @@ features = [
 ]
 
 [target.'cfg(target_os = "toyos")'.dependencies]
-toyos-abi = "0.1"
-toyos = "0.1"
+toyos-abi = "0.12"
+toyos = "0.13"
 
 [features]
 # Enable all API, even ones not available on all OSs.
