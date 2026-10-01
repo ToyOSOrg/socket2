@@ -21,7 +21,7 @@ use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::time::Duration;
 
 use crate::sys::{self, c_int, getsockopt, setsockopt, Bool};
-#[cfg(not(any(target_os = "redox", target_os = "wasi")))]
+#[cfg(any(all(unix, not(target_os = "redox")), target_os = "toyos"))]
 use crate::MsgHdrMut;
 use crate::{Domain, Protocol, SockAddr, TcpKeepalive, Type};
 #[cfg(not(any(target_os = "redox", target_os = "wasi")))]
