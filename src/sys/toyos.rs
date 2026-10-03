@@ -9,9 +9,9 @@
 //! ToyOS platform implementation for socket2.
 //!
 //! ToyOS uses a microkernel architecture where networking is handled by
-//! the `netd` daemon via IPC message passing and kernel pipes. This module
+//! the `netstack` daemon via IPC message passing and kernel pipes. This module
 //! implements socket2's sys interface by translating socket operations into
-//! netd IPC calls.
+//! netstack IPC calls.
 
 
 use std::collections::HashMap;
@@ -371,10 +371,10 @@ fn net_err_to_io(e: NetError) -> io::Error {
         NetError::AddrInUse => io::ErrorKind::AddrInUse,
         NetError::NotConnected => io::ErrorKind::NotConnected,
         NetError::InvalidInput => io::ErrorKind::InvalidInput,
-        NetError::NetdNotFound => io::ErrorKind::NotConnected,
+        NetError::NetstackNotFound => io::ErrorKind::NotConnected,
         _ => io::ErrorKind::Other,
     };
-    io::Error::new(kind, "netd error")
+    io::Error::new(kind, "netstack error")
 }
 
 // ---------------------------------------------------------------------------
