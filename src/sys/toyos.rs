@@ -8,25 +8,22 @@
 
 //! ToyOS platform implementation for socket2.
 //!
-//! ToyOS uses a microkernel architecture where networking is handled by
-//! the `netstack` daemon via IPC message passing and kernel pipes. This module
-//! implements socket2's sys interface by translating socket operations into
-//! netstack IPC calls.
+//! ToyOS's network server is the `netstack` program. A connected or accepted
+//! socket here is std's `TcpStream`, and a listening one std's `TcpListener`:
+//! std holds a process's stream ends, one per stream however many handles
+//! reach it, so this module reaches netstack through std and holds no stream
+//! state of its own. What std has no word for, an unconnected socket's
+//! options before its connect, is kept here.
 
 
 use std::collections::HashMap;
-use std::io::{self, IoSlice};
+use std::io::{self, IoSlice, Read, Write};
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-
-use toyos_abi::RawHandle;
-use toyos_abi::syscall::{self, SyscallError};
-use toyos::AsHandle;
-use toyos::net::{self, NetError, TcpSocketId};
 
 use crate::{SockAddr, TcpKeepalive};
 
@@ -340,41 +337,25 @@ enum SocketState {
         send_timeout: Option<Duration>,
         bind_addr: Option<([u8; 4], u16)>,
     },
-    /// TCP stream (connected). `handle` is the kernel `Connection` the two
-    /// simplex pipe ends were joined into.
-    Connected {
-        handle: RawHandle,
-        socket_id: u32,
-        local_port: u16,
-        peer_addr: [u8; 4],
-        peer_port: u16,
-        nonblocking: bool,
-        nodelay: bool,
-        recv_timeout: Option<Duration>,
-        send_timeout: Option<Duration>,
-    },
-    /// TCP listener (bound + listening). `handle` is the notify pipe's read end.
-    Listening {
-        handle: RawHandle,
-        socket_id: u32,
-        local_addr: [u8; 4],
-        local_port: u16,
-        nonblocking: bool,
-    },
+    /// TCP stream, connected or accepted.
+    Connected(Arc<TcpStream>),
+    /// TCP listener, bound and listening.
+    Listening(Arc<TcpListener>),
 }
 
-fn net_err_to_io(e: NetError) -> io::Error {
-    let kind = match e {
-        NetError::ConnectionRefused => io::ErrorKind::ConnectionRefused,
-        NetError::ConnectionReset => io::ErrorKind::ConnectionReset,
-        NetError::TimedOut => io::ErrorKind::TimedOut,
-        NetError::AddrInUse => io::ErrorKind::AddrInUse,
-        NetError::NotConnected => io::ErrorKind::NotConnected,
-        NetError::InvalidInput => io::ErrorKind::InvalidInput,
-        NetError::NetstackNotFound => io::ErrorKind::NotConnected,
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::new(kind, "netstack error")
+/// The socket `fd` names, as the state it is in.
+fn state<T>(fd: RawSocket, f: impl FnOnce(&mut SocketState) -> io::Result<T>) -> io::Result<T> {
+    let mut map = sockets().lock().unwrap();
+    let state = map.get_mut(&fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
+    f(state)
+}
+
+/// The stream `fd` names, outside the table's lock.
+fn stream(fd: RawSocket) -> io::Result<Arc<TcpStream>> {
+    state(fd, |state| match state {
+        SocketState::Connected(stream) => Ok(stream.clone()),
+        _ => Err(io::ErrorKind::NotConnected.into()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -407,16 +388,7 @@ pub(crate) struct Socket(c_int);
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        if let Some(state) = sockets().lock().unwrap().remove(&self.0) {
-            match state {
-                SocketState::Connected { handle, socket_id, .. }
-                | SocketState::Listening { handle, socket_id, .. } => {
-                    let _ = toyos::net::tcp_close(TcpSocketId(socket_id));
-                    syscall::close(handle);
-                }
-                SocketState::Unconnected { .. } => {}
-            }
-        }
+        sockets().lock().unwrap().remove(&self.0);
     }
 }
 
@@ -480,283 +452,88 @@ pub(crate) fn bind(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
 
 pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
     let (ip, port) = sockaddr_to_v4(addr)?;
-
-    let conn = toyos::net::tcp_connect(ip, port, 30000).map_err(net_err_to_io)?;
-
-    // One duplex handle out of the two simplex ends. The join takes references
-    // of its own, so the ends are closed here.
-    let handle = syscall::connection_join(conn.rx.as_handle(), conn.tx.as_handle())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connection_join: {e:?}")))?;
-
-    drop(conn.rx);
-    drop(conn.tx);
-
-    let mut map = sockets().lock().unwrap();
-    let old = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-
-    let (nonblocking, nodelay, recv_timeout, send_timeout) = match old {
-        SocketState::Unconnected {
-            nonblocking,
-            nodelay,
-            recv_timeout,
-            send_timeout,
-            ..
-        } => (*nonblocking, *nodelay, *recv_timeout, *send_timeout),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket already connected",
-            ))
+    let (nonblocking, nodelay, recv_timeout, send_timeout) = state(fd, |state| match state {
+        SocketState::Unconnected { nonblocking, nodelay, recv_timeout, send_timeout, .. } => {
+            Ok((*nonblocking, *nodelay, *recv_timeout, *send_timeout))
         }
-    };
-
-    map.insert(
-        fd,
-        SocketState::Connected {
-            handle,
-            socket_id: conn.socket_id.0,
-            local_port: conn.local_port,
-            peer_addr: ip,
-            peer_port: port,
-            nonblocking,
-            nodelay,
-            recv_timeout,
-            send_timeout,
-        },
-    );
-
-    // Apply queued nodelay option
-    if nodelay {
-        let _ = toyos::net::tcp_set_option(conn.socket_id, toyos::net::OPT_NODELAY, 1);
-    }
-
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "socket already connected")),
+    })?;
+    let stream = TcpStream::connect_timeout(&SocketAddr::from((ip, port)), Duration::from_secs(30))?;
+    stream.set_nonblocking(nonblocking)?;
+    stream.set_nodelay(nodelay)?;
+    stream.set_read_timeout(recv_timeout)?;
+    stream.set_write_timeout(send_timeout)?;
+    sockets().lock().unwrap().insert(fd, SocketState::Connected(Arc::new(stream)));
     Ok(())
 }
 
 pub(crate) fn poll_connect(socket: &crate::Socket, _timeout: Duration) -> io::Result<()> {
     // On ToyOS, connect is synchronous — if we're Connected, it succeeded.
-    let map = sockets().lock().unwrap();
-    match map.get(&socket.as_raw()) {
-        Some(SocketState::Connected { .. }) => Ok(()),
-        _ => Err(io::ErrorKind::NotConnected.into()),
-    }
+    stream(socket.as_raw()).map(drop)
 }
 
 pub(crate) fn listen(fd: RawSocket, _backlog: c_int) -> io::Result<()> {
-    let mut map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-
-    let (ip, port, nonblocking) = match state {
-        SocketState::Unconnected {
-            bind_addr,
-            nonblocking,
-            ..
-        } => {
-            let (ip, port) = bind_addr.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "socket not bound")
-            })?;
-            (ip, port, *nonblocking)
+    let (ip, port, nonblocking) = state(fd, |state| match state {
+        SocketState::Unconnected { bind_addr, nonblocking, .. } => {
+            let (ip, port) = bind_addr.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket not bound"))?;
+            Ok((ip, port, *nonblocking))
         }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket already connected or listening",
-            ))
-        }
-    };
-
-    let bound = toyos::net::tcp_bind(ip, port).map_err(net_err_to_io)?;
-
-    map.insert(
-        fd,
-        SocketState::Listening {
-            handle: bound.notify.into_raw(),
-            socket_id: bound.socket_id.0,
-            local_addr: ip,
-            local_port: bound.bound_port,
-            nonblocking,
-        },
-    );
-
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "socket already connected or listening")),
+    })?;
+    let listener = TcpListener::bind(SocketAddr::from((ip, port)))?;
+    listener.set_nonblocking(nonblocking)?;
+    sockets().lock().unwrap().insert(fd, SocketState::Listening(Arc::new(listener)));
     Ok(())
 }
 
 pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
-    let map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-
-    let (socket_id, handle, nonblocking) = match state {
-        SocketState::Listening {
-            socket_id,
-            handle,
-            nonblocking,
-            ..
-        } => (*socket_id, *handle, *nonblocking),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket not listening",
-            ))
-        }
-    };
-    drop(map);
-
-    // Wait for a connection notification
-    let mut buf = [0u8; 1];
-    if nonblocking {
-        match syscall::read_nonblock(handle, &mut buf) {
-            Ok(_) => {}
-            Err(SyscallError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-    } else {
-        match syscall::read(handle, &mut buf) {
-            Ok(_) => {}
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-    }
-
-    let accepted = toyos::net::tcp_accept(TcpSocketId(socket_id)).map_err(net_err_to_io)?;
-
-    // One duplex handle out of the two simplex ends, as in `connect`.
-    let new_handle = syscall::connection_join(accepted.rx.as_handle(), accepted.tx.as_handle())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connection_join: {e:?}")))?;
-
-    drop(accepted.rx);
-    drop(accepted.tx);
-
+    let listener = state(fd, |state| match state {
+        SocketState::Listening(listener) => Ok(listener.clone()),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "socket not listening")),
+    })?;
+    let (accepted, peer) = listener.accept()?;
     let new_fd = alloc_fd();
-    sockets().lock().unwrap().insert(
-        new_fd,
-        SocketState::Connected {
-            handle: new_handle,
-            socket_id: accepted.socket_id.0,
-            local_port: accepted.local_port,
-            peer_addr: accepted.remote_addr,
-            peer_port: accepted.remote_port,
-            nonblocking: false,
-            nodelay: false,
-            recv_timeout: None,
-            send_timeout: None,
-        },
-    );
-
-    let peer = make_sockaddr_v4(accepted.remote_addr, accepted.remote_port);
-    Ok((new_fd, peer))
+    sockets().lock().unwrap().insert(new_fd, SocketState::Connected(Arc::new(accepted)));
+    Ok((new_fd, SockAddr::from(peer)))
 }
 
 pub(crate) fn getsockname(fd: RawSocket) -> io::Result<SockAddr> {
-    let map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    match state {
-        SocketState::Connected { local_port, .. } => {
-            Ok(make_sockaddr_v4([0, 0, 0, 0], *local_port))
-        }
-        SocketState::Listening {
-            local_addr,
-            local_port,
-            ..
-        } => Ok(make_sockaddr_v4(*local_addr, *local_port)),
+    state(fd, |state| match state {
+        SocketState::Connected(stream) => stream.local_addr().map(SockAddr::from),
+        SocketState::Listening(listener) => listener.local_addr().map(SockAddr::from),
         SocketState::Unconnected { bind_addr, .. } => match bind_addr {
             Some((ip, port)) => Ok(make_sockaddr_v4(*ip, *port)),
             None => Ok(make_sockaddr_v4([0, 0, 0, 0], 0)),
         },
-    }
+    })
 }
 
 pub(crate) fn getpeername(fd: RawSocket) -> io::Result<SockAddr> {
-    let map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    match state {
-        SocketState::Connected {
-            peer_addr,
-            peer_port,
-            ..
-        } => Ok(make_sockaddr_v4(*peer_addr, *peer_port)),
-        _ => Err(io::ErrorKind::NotConnected.into()),
-    }
+    stream(fd)?.peer_addr().map(SockAddr::from)
 }
 
 pub(crate) fn try_clone(fd: RawSocket) -> io::Result<RawSocket> {
-    let map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    match state {
-        SocketState::Connected { handle, socket_id, local_port, peer_addr, peer_port, nonblocking, nodelay, recv_timeout, send_timeout } => {
-            let new_handle = syscall::dup(*handle)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("dup: {e:?}")))?;
-            let new_fd = alloc_fd();
-            let cloned = SocketState::Connected {
-                handle: new_handle,
-                socket_id: *socket_id,
-                local_port: *local_port,
-                peer_addr: *peer_addr,
-                peer_port: *peer_port,
-                nonblocking: *nonblocking,
-                nodelay: *nodelay,
-                recv_timeout: *recv_timeout,
-                send_timeout: *send_timeout,
-            };
-            drop(map);
-            sockets().lock().unwrap().insert(new_fd, cloned);
-            Ok(new_fd)
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "can only clone connected sockets",
-        )),
-    }
+    let cloned = stream(fd)
+        .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "can only clone connected sockets"))?
+        .try_clone()?;
+    let new_fd = alloc_fd();
+    sockets().lock().unwrap().insert(new_fd, SocketState::Connected(Arc::new(cloned)));
+    Ok(new_fd)
 }
 
 pub(crate) fn set_nonblocking(fd: RawSocket, nonblocking: bool) -> io::Result<()> {
-    let mut map = sockets().lock().unwrap();
-    let state = map
-        .get_mut(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    match state {
-        SocketState::Unconnected {
-            nonblocking: nb, ..
-        }
-        | SocketState::Connected {
-            nonblocking: nb, ..
-        }
-        | SocketState::Listening {
-            nonblocking: nb, ..
-        } => {
+    state(fd, |state| match state {
+        SocketState::Unconnected { nonblocking: nb, .. } => {
             *nb = nonblocking;
             Ok(())
         }
-    }
+        SocketState::Connected(stream) => stream.set_nonblocking(nonblocking),
+        SocketState::Listening(listener) => listener.set_nonblocking(nonblocking),
+    })
 }
 
 pub(crate) fn shutdown(fd: RawSocket, how: Shutdown) -> io::Result<()> {
-    let map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    let socket_id = match state {
-        SocketState::Connected { socket_id, .. } => *socket_id,
-        _ => return Err(io::ErrorKind::NotConnected.into()),
-    };
-    drop(map);
-
-    let how_val = match how {
-        Shutdown::Read => 0u32,
-        Shutdown::Write => 1,
-        Shutdown::Both => 2,
-    };
-    toyos::net::tcp_shutdown(TcpSocketId(socket_id), how_val).map_err(net_err_to_io)
+    stream(fd)?.shutdown(how)
 }
 
 // ---------------------------------------------------------------------------
@@ -768,94 +545,15 @@ pub(crate) fn recv(
     buf: &mut [MaybeUninit<u8>],
     _flags: c_int,
 ) -> io::Result<usize> {
-    let map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    let (handle, nonblocking, recv_timeout) = match state {
-        SocketState::Connected {
-            handle,
-            nonblocking,
-            recv_timeout,
-            ..
-        } => (*handle, *nonblocking, *recv_timeout),
-        _ => return Err(io::ErrorKind::NotConnected.into()),
-    };
-    drop(map);
-
-    // SAFETY: MaybeUninit<u8> has the same layout as u8
-    let raw_buf = unsafe {
-        std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len())
-    };
-
-    if nonblocking {
-        match syscall::read_nonblock(handle, raw_buf) {
-            Ok(n) => Ok(n),
-            Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
-            Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-    } else if let Some(timeout) = recv_timeout {
-        let poller = toyos::poller::Poller::new(1);
-        poller.watch_raw(handle, toyos::poller::READABLE, 0);
-        let mut ready = false;
-        poller.wait(1, timeout.as_nanos() as u64, |_| ready = true);
-        if ready {
-            match syscall::read(handle, raw_buf) {
-                Ok(n) => Ok(n),
-                Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-            }
-        } else {
-            Err(io::ErrorKind::TimedOut.into())
-        }
-    } else {
-        match syscall::read(handle, raw_buf) {
-            Ok(n) => Ok(n),
-            Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-    }
+    let stream = stream(fd)?;
+    // SAFETY: MaybeUninit<u8> has the same layout as u8, and a read only
+    // writes what it answers.
+    let raw_buf = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len()) };
+    (&*stream).read(raw_buf)
 }
 
 pub(crate) fn send(fd: RawSocket, buf: &[u8], _flags: c_int) -> io::Result<usize> {
-    let map = sockets().lock().unwrap();
-    let state = map
-        .get(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    let (handle, nonblocking, send_timeout) = match state {
-        SocketState::Connected {
-            handle,
-            nonblocking,
-            send_timeout,
-            ..
-        } => (*handle, *nonblocking, *send_timeout),
-        _ => return Err(io::ErrorKind::NotConnected.into()),
-    };
-    drop(map);
-
-    if nonblocking {
-        match syscall::write_nonblock(handle, buf) {
-            Ok(n) => Ok(n),
-            Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
-            Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-    } else if let Some(timeout) = send_timeout {
-        let poller = toyos::poller::Poller::new(1);
-        poller.watch_raw(handle, toyos::poller::WRITABLE, 0);
-        let mut ready = false;
-        poller.wait(1, timeout.as_nanos() as u64, |_| ready = true);
-        if ready {
-            match syscall::write(handle, buf) {
-                Ok(n) => Ok(n),
-                Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-            }
-        } else {
-            Err(io::ErrorKind::TimedOut.into())
-        }
-    } else {
-        match syscall::write(handle, buf) {
-            Ok(n) => Ok(n),
-            Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-    }
+    (&*stream(fd)?).write(buf)
 }
 
 pub(crate) fn recv_from(
@@ -914,7 +612,7 @@ pub(crate) unsafe fn getsockopt<T: Copy>(
         (SOL_SOCKET, SO_ERROR) => ret!(0),
         (SOL_SOCKET, SO_TYPE) => match state {
             SocketState::Unconnected { sock_type, .. } => ret!(*sock_type),
-            SocketState::Connected { .. } | SocketState::Listening { .. } => ret!(SOCK_STREAM),
+            SocketState::Connected(_) | SocketState::Listening(_) => ret!(SOCK_STREAM),
         },
         (SOL_SOCKET, SO_KEEPALIVE) => ret!(0),
         (SOL_SOCKET, SO_BROADCAST) => ret!(0),
@@ -939,9 +637,9 @@ pub(crate) unsafe fn getsockopt<T: Copy>(
             return Ok(result.assume_init());
         }
         (IPPROTO_TCP, TCP_NODELAY) => match state {
-            SocketState::Unconnected { nodelay, .. }
-            | SocketState::Connected { nodelay, .. } => ret!(if *nodelay { 1 } else { 0 }),
-            _ => ret!(0),
+            SocketState::Unconnected { nodelay, .. } => ret!(if *nodelay { 1 } else { 0 }),
+            SocketState::Connected(stream) => ret!(if stream.nodelay()? { 1 } else { 0 }),
+            SocketState::Listening(_) => ret!(0),
         },
         (IPPROTO_IP, IP_TTL) | (IPPROTO_IPV6, IPV6_UNICAST_HOPS) => ret!(64),
         (IPPROTO_IP, IP_MULTICAST_TTL) | (IPPROTO_IPV6, IPV6_MULTICAST_HOPS) => ret!(1),
@@ -979,21 +677,11 @@ pub(crate) unsafe fn setsockopt<T>(
         (SOL_SOCKET, SO_RCVBUF) => {}    // no-op
         (SOL_SOCKET, SO_SNDBUF) => {}    // no-op
         (SOL_SOCKET, SO_LINGER) => {}    // no-op
-        (IPPROTO_TCP, TCP_NODELAY) => {
-            match state {
-                SocketState::Unconnected { nodelay, .. } => *nodelay = value != 0,
-                SocketState::Connected {
-                    nodelay, socket_id, ..
-                } => {
-                    *nodelay = value != 0;
-                    let sid = *socket_id;
-                    drop(map);
-                    let _ = toyos::net::tcp_set_option(TcpSocketId(sid), toyos::net::OPT_NODELAY, value as u32);
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
+        (IPPROTO_TCP, TCP_NODELAY) => match state {
+            SocketState::Unconnected { nodelay, .. } => *nodelay = value != 0,
+            SocketState::Connected(stream) => stream.set_nodelay(value != 0)?,
+            SocketState::Listening(_) => {}
+        },
         (IPPROTO_IP, IP_TTL) | (IPPROTO_IPV6, IPV6_UNICAST_HOPS) => {} // no-op
         (IPPROTO_IP, IP_MULTICAST_TTL) => {}                            // no-op
         (IPPROTO_IP, IP_MULTICAST_LOOP) | (IPPROTO_IPV6, IPV6_MULTICAST_LOOP) => {} // no-op
@@ -1031,23 +719,16 @@ pub(crate) fn timeout_opt(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
 
     let timeout = match state {
-        SocketState::Unconnected {
-            recv_timeout,
-            send_timeout,
-            ..
-        }
-        | SocketState::Connected {
-            recv_timeout,
-            send_timeout,
-            ..
-        } => {
+        SocketState::Unconnected { recv_timeout, send_timeout, .. } => {
             if val == SO_RCVTIMEO {
                 *recv_timeout
             } else {
                 *send_timeout
             }
         }
-        _ => None,
+        SocketState::Connected(stream) if val == SO_RCVTIMEO => stream.read_timeout()?,
+        SocketState::Connected(stream) => stream.write_timeout()?,
+        SocketState::Listening(_) => None,
     };
     Ok(timeout)
 }
@@ -1064,23 +745,16 @@ pub(crate) fn set_timeout_opt(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
 
     match state {
-        SocketState::Unconnected {
-            recv_timeout,
-            send_timeout,
-            ..
-        }
-        | SocketState::Connected {
-            recv_timeout,
-            send_timeout,
-            ..
-        } => {
+        SocketState::Unconnected { recv_timeout, send_timeout, .. } => {
             if val == SO_RCVTIMEO {
                 *recv_timeout = duration;
             } else {
                 *send_timeout = duration;
             }
         }
-        _ => {}
+        SocketState::Connected(stream) if val == SO_RCVTIMEO => stream.set_read_timeout(duration)?,
+        SocketState::Connected(stream) => stream.set_write_timeout(duration)?,
+        SocketState::Listening(_) => {}
     }
     Ok(())
 }

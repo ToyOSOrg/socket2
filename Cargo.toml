@@ -62,10 +62,6 @@ features = [
   "Win32_System_WindowsProgramming",
 ]
 
-[target.'cfg(target_os = "toyos")'.dependencies]
-toyos-abi = ">=0.12, <1"
-toyos = ">=0.13, <1"
-
 [features]
 # Enable all API, even ones not available on all OSs.
 all = []
