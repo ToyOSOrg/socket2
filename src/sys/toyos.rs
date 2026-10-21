@@ -319,8 +319,11 @@ impl std::fmt::Debug for crate::Protocol {
 // Internal state machine
 // ---------------------------------------------------------------------------
 
-/// A socket's key here, beside a tag no other library's object word carries.
+/// A socket's key here: one of `KEYS` beside a tag no other library's object
+/// word carries.
 const TAG: u64 = 0x736f_636b_3200_0000;
+const KEYS: u64 = 0xff_ffff;
+/// Where the search for a free key starts.
 static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
 
 fn sockets() -> &'static Mutex<HashMap<u64, SocketState>> {
@@ -328,13 +331,22 @@ fn sockets() -> &'static Mutex<HashMap<u64, SocketState>> {
     SOCKETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// `state` as a socket: the lowest free descriptor, inherited as a socket's
-/// is, naming it.
+/// `state` as a socket: the lowest free descriptor, not inherited, as unix's
+/// socket is made `SOCK_CLOEXEC`, naming it. A key is reused once its socket
+/// is gone; the search ends, since a process's table holds far fewer
+/// descriptors than there are keys.
 fn install(state: SocketState) -> io::Result<RawSocket> {
-    let key = TAG | NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    sockets().lock().unwrap().insert(key, state);
+    let mut map = sockets().lock().unwrap();
+    let key = loop {
+        let key = TAG | (NEXT_KEY.fetch_add(1, Ordering::Relaxed) & KEYS);
+        if !map.contains_key(&key) {
+            break key;
+        }
+    };
+    map.insert(key, state);
+    drop(map);
     // On a full table the object is let go, and with it the socket.
-    toyos::fd::install(toyos::fd::Object::opaque(key, release), true, 0)
+    toyos::fd::install(toyos::fd::Object::opaque(key, release), false, 0)
         .map_err(|_| io::Error::new(io::ErrorKind::QuotaExceeded, "the descriptor table is full"))
 }
 
@@ -348,7 +360,7 @@ extern "C" fn release(key: u64) {
 /// names no socket of this module's.
 fn key(fd: RawSocket) -> Option<u64> {
     let word = toyos::fd::with(fd, |o| o.release.map(|_| o.word)).ok().flatten()?;
-    (word & !0xff_ffff == TAG).then_some(word)
+    (word & !KEYS == TAG).then_some(word)
 }
 
 enum SocketState {
@@ -532,10 +544,11 @@ pub(crate) fn getpeername(fd: RawSocket) -> io::Result<SockAddr> {
     stream(fd)?.peer_addr().map(SockAddr::from)
 }
 
-/// A second descriptor on the same socket, as `dup` makes.
+/// A second descriptor on the same socket, not inherited, as unix's
+/// `F_DUPFD_CLOEXEC` makes.
 pub(crate) fn try_clone(fd: RawSocket) -> io::Result<RawSocket> {
     key(fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    toyos::fd::dup(fd, 0, true).map_err(|_| io::Error::new(io::ErrorKind::QuotaExceeded, "the descriptor table is full"))
+    toyos::fd::dup(fd, 0, false).map_err(|_| io::Error::new(io::ErrorKind::QuotaExceeded, "the descriptor table is full"))
 }
 
 pub(crate) fn set_nonblocking(fd: RawSocket, nonblocking: bool) -> io::Result<()> {
