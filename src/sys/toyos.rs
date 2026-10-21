@@ -14,6 +14,11 @@
 //! reach it, so this module reaches netstack through std and holds no stream
 //! state of its own. What std has no word for, an unconnected socket's
 //! options before its connect, is kept here.
+//!
+//! A socket's number is a descriptor in the process's one table
+//! (`toyos::fd`), naming an object of this module's own: its word is the
+//! socket's key here, and the socket goes when no descriptor names it. So
+//! `try_clone` is a second descriptor on the same socket, as `dup` is.
 
 
 use std::collections::HashMap;
@@ -21,7 +26,7 @@ use std::io::{self, IoSlice, Read, Write};
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -314,15 +319,36 @@ impl std::fmt::Debug for crate::Protocol {
 // Internal state machine
 // ---------------------------------------------------------------------------
 
-static NEXT_FD: AtomicI32 = AtomicI32::new(1000);
+/// A socket's key here, beside a tag no other library's object word carries.
+const TAG: u64 = 0x736f_636b_3200_0000;
+static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
 
-fn sockets() -> &'static Mutex<HashMap<c_int, SocketState>> {
-    static SOCKETS: OnceLock<Mutex<HashMap<c_int, SocketState>>> = OnceLock::new();
+fn sockets() -> &'static Mutex<HashMap<u64, SocketState>> {
+    static SOCKETS: OnceLock<Mutex<HashMap<u64, SocketState>>> = OnceLock::new();
     SOCKETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn alloc_fd() -> c_int {
-    NEXT_FD.fetch_add(1, Ordering::Relaxed)
+/// `state` as a socket: the lowest free descriptor, inherited as a socket's
+/// is, naming it.
+fn install(state: SocketState) -> io::Result<RawSocket> {
+    let key = TAG | NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+    sockets().lock().unwrap().insert(key, state);
+    // On a full table the object is let go, and with it the socket.
+    toyos::fd::install(toyos::fd::Object::opaque(key, release), true, 0)
+        .map_err(|_| io::Error::new(io::ErrorKind::QuotaExceeded, "the descriptor table is full"))
+}
+
+/// A socket no descriptor names any more.
+extern "C" fn release(key: u64) {
+    let gone = sockets().lock().unwrap().remove(&key);
+    drop(gone);
+}
+
+/// The socket descriptor `fd` names: its key, or `None` for a descriptor that
+/// names no socket of this module's.
+fn key(fd: RawSocket) -> Option<u64> {
+    let word = toyos::fd::with(fd, |o| o.release.map(|_| o.word)).ok().flatten()?;
+    (word & !0xff_ffff == TAG).then_some(word)
 }
 
 enum SocketState {
@@ -345,8 +371,9 @@ enum SocketState {
 
 /// The socket `fd` names, as the state it is in.
 fn state<T>(fd: RawSocket, f: impl FnOnce(&mut SocketState) -> io::Result<T>) -> io::Result<T> {
+    let key = key(fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
     let mut map = sockets().lock().unwrap();
-    let state = map.get_mut(&fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
+    let state = map.get_mut(&key).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
     f(state)
 }
 
@@ -388,7 +415,7 @@ pub(crate) struct Socket(c_int);
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        sockets().lock().unwrap().remove(&self.0);
+        let _ = toyos::fd::close(self.0);
     }
 }
 
@@ -415,30 +442,21 @@ pub(crate) fn socket_into_raw(socket: Socket) -> RawSocket {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn socket(family: c_int, ty: c_int, _protocol: c_int) -> io::Result<RawSocket> {
-    let fd = alloc_fd();
-    sockets().lock().unwrap().insert(
-        fd,
-        SocketState::Unconnected {
-            domain: family,
-            sock_type: ty,
-            nonblocking: false,
-            nodelay: false,
-            reuse_addr: false,
-            recv_timeout: None,
-            send_timeout: None,
-            bind_addr: None,
-        },
-    );
-    Ok(fd)
+    install(SocketState::Unconnected {
+        domain: family,
+        sock_type: ty,
+        nonblocking: false,
+        nodelay: false,
+        reuse_addr: false,
+        recv_timeout: None,
+        send_timeout: None,
+        bind_addr: None,
+    })
 }
 
 pub(crate) fn bind(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
     let (ip, port) = sockaddr_to_v4(addr)?;
-    let mut map = sockets().lock().unwrap();
-    let state = map
-        .get_mut(&fd)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
-    match state {
+    state(fd, |state| match state {
         SocketState::Unconnected { bind_addr, .. } => {
             *bind_addr = Some((ip, port));
             Ok(())
@@ -447,7 +465,7 @@ pub(crate) fn bind(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             "socket already connected or listening",
         )),
-    }
+    })
 }
 
 pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
@@ -463,8 +481,10 @@ pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
     stream.set_nodelay(nodelay)?;
     stream.set_read_timeout(recv_timeout)?;
     stream.set_write_timeout(send_timeout)?;
-    sockets().lock().unwrap().insert(fd, SocketState::Connected(Arc::new(stream)));
-    Ok(())
+    state(fd, |state| {
+        *state = SocketState::Connected(Arc::new(stream));
+        Ok(())
+    })
 }
 
 pub(crate) fn poll_connect(socket: &crate::Socket, _timeout: Duration) -> io::Result<()> {
@@ -482,8 +502,10 @@ pub(crate) fn listen(fd: RawSocket, _backlog: c_int) -> io::Result<()> {
     })?;
     let listener = TcpListener::bind(SocketAddr::from((ip, port)))?;
     listener.set_nonblocking(nonblocking)?;
-    sockets().lock().unwrap().insert(fd, SocketState::Listening(Arc::new(listener)));
-    Ok(())
+    state(fd, |state| {
+        *state = SocketState::Listening(Arc::new(listener));
+        Ok(())
+    })
 }
 
 pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
@@ -492,9 +514,7 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "socket not listening")),
     })?;
     let (accepted, peer) = listener.accept()?;
-    let new_fd = alloc_fd();
-    sockets().lock().unwrap().insert(new_fd, SocketState::Connected(Arc::new(accepted)));
-    Ok((new_fd, SockAddr::from(peer)))
+    Ok((install(SocketState::Connected(Arc::new(accepted)))?, SockAddr::from(peer)))
 }
 
 pub(crate) fn getsockname(fd: RawSocket) -> io::Result<SockAddr> {
@@ -512,13 +532,10 @@ pub(crate) fn getpeername(fd: RawSocket) -> io::Result<SockAddr> {
     stream(fd)?.peer_addr().map(SockAddr::from)
 }
 
+/// A second descriptor on the same socket, as `dup` makes.
 pub(crate) fn try_clone(fd: RawSocket) -> io::Result<RawSocket> {
-    let cloned = stream(fd)
-        .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "can only clone connected sockets"))?
-        .try_clone()?;
-    let new_fd = alloc_fd();
-    sockets().lock().unwrap().insert(new_fd, SocketState::Connected(Arc::new(cloned)));
-    Ok(new_fd)
+    key(fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
+    toyos::fd::dup(fd, 0, true).map_err(|_| io::Error::new(io::ErrorKind::QuotaExceeded, "the descriptor table is full"))
 }
 
 pub(crate) fn set_nonblocking(fd: RawSocket, nonblocking: bool) -> io::Result<()> {
@@ -592,7 +609,7 @@ pub(crate) unsafe fn getsockopt<T: Copy>(
 ) -> io::Result<T> {
     let map = sockets().lock().unwrap();
     let state = map
-        .get(&fd)
+        .get(&key(fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
 
     // Most options return c_int (0 or 1 for booleans, actual value otherwise)
@@ -663,7 +680,7 @@ pub(crate) unsafe fn setsockopt<T>(
 
     let mut map = sockets().lock().unwrap();
     let state = map
-        .get_mut(&fd)
+        .get_mut(&key(fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
 
     match (opt, val) {
@@ -715,7 +732,7 @@ pub(crate) fn timeout_opt(
 ) -> io::Result<Option<Duration>> {
     let map = sockets().lock().unwrap();
     let state = map
-        .get(&fd)
+        .get(&key(fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
 
     let timeout = match state {
@@ -741,7 +758,7 @@ pub(crate) fn set_timeout_opt(
 ) -> io::Result<()> {
     let mut map = sockets().lock().unwrap();
     let state = map
-        .get_mut(&fd)
+        .get_mut(&key(fd).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid socket fd"))?;
 
     match state {

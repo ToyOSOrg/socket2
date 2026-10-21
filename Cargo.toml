@@ -52,6 +52,9 @@ features = ["all"]
 [target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
 libc = "0.2.172"
 
+[target.'cfg(target_os = "toyos")'.dependencies]
+toyos = ">=0.18, <1"
+
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = ">=0.60, <0.62"
 features = [
